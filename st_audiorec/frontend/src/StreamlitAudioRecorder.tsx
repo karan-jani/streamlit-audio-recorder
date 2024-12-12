@@ -14,10 +14,13 @@ interface State {
   audioData: Float32Array | null
   analyser: AnalyserNode | null
   animationId: number | null
+  previewChunks: Blob[]
 }
 
 class StreamlitAudioRecorder extends StreamlitComponentBase {
   private canvasRef: React.RefObject<HTMLCanvasElement | null>
+  private sessionId: string;
+  private recordingId: string;
 
   constructor(props: any) {
     super(props)
@@ -29,9 +32,16 @@ class StreamlitAudioRecorder extends StreamlitComponentBase {
       audioUrl: null,
       audioData: null,
       analyser: null,
-      animationId: null
+      animationId: null,
+      previewChunks: []
     }
     this.canvasRef = React.createRef<HTMLCanvasElement | null>()
+    this.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    this.recordingId = this.generateRecordingId();
+  }
+
+  generateRecordingId = (): string => {
+    return 'rec_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
   }
 
   componentDidMount() {
@@ -129,6 +139,8 @@ class StreamlitAudioRecorder extends StreamlitComponentBase {
 
   startRecording = async () => {
     try {
+      this.recordingId = this.generateRecordingId();
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -149,37 +161,78 @@ class StreamlitAudioRecorder extends StreamlitComponentBase {
         audioBitsPerSecond: 128000
       })
 
+      // Send chunks every 5 seconds to stay well under Streamlit's size limits
+      const CHUNK_INTERVAL = 5000; // 5 seconds
+      let currentChunks: Blob[] = [];
+      let chunkCounter = 0;
+
       mediaRecorder.ondataavailable = (e: BlobEvent) => {
         if (e.data.size > 0) {
+          currentChunks.push(e.data);
           this.setState((prev: State) => ({
-            chunks: [...prev.chunks, e.data]
-          }))
+            previewChunks: [...prev.previewChunks, e.data]
+          }));
         }
-      }
+      };
 
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(this.state.chunks, { type: 'audio/webm;codecs=opus' })
+      // Periodically send chunks
+      const sendChunksInterval = setInterval(async () => {
+        if (currentChunks.length > 0 && this.state.isRecording) {
+          const blob = new Blob(currentChunks, { type: 'audio/webm;codecs=opus' });
+          currentChunks = []; // Clear current chunks after creating blob
+          
+          const buffer = await blob.arrayBuffer();
+          const uint8Array = new Uint8Array(buffer);
+          Streamlit.setComponentValue({
+            arr: Object.fromEntries(uint8Array.entries()),
+            chunkId: chunkCounter++,
+            sessionId: this.sessionId,
+            recordingId: this.recordingId,
+            isFinal: false
+          });
+        }
+      }, CHUNK_INTERVAL);
+
+      mediaRecorder.onstop = async () => {
+        clearInterval(sendChunksInterval);
         
-        // Update UI state
+        // Send any remaining chunks
+        if (currentChunks.length > 0) {
+          const blob = new Blob(currentChunks, { type: 'audio/webm;codecs=opus' });
+          const buffer = await blob.arrayBuffer();
+          const uint8Array = new Uint8Array(buffer);
+          Streamlit.setComponentValue({
+            arr: Object.fromEntries(uint8Array.entries()),
+            chunkId: chunkCounter,
+            sessionId: this.sessionId,
+            recordingId: this.recordingId,
+            isFinal: true
+          });
+        }
+
+        // Create preview blob from all chunks
+        const previewBlob = new Blob(this.state.previewChunks, { type: 'audio/webm;codecs=opus' });
+        
         this.setState({ 
           chunks: [], 
-          audioBlob: blob,
+          previewChunks: [],
           isRecording: false,
           mediaRecorder: null,
-          audioUrl: URL.createObjectURL(blob)
-        })
-        
-        // Convert to array and send
-        blob.arrayBuffer().then(buffer => {
-          const uint8Array = new Uint8Array(buffer)
-          Streamlit.setComponentValue({
-            arr: Object.fromEntries(uint8Array.entries())
-          })
-        })
-      }
+          audioBlob: previewBlob,
+          audioUrl: URL.createObjectURL(previewBlob)
+        });
+      };
 
-      mediaRecorder.start(100)
-      this.setState({ mediaRecorder, isRecording: true, analyser }, this.drawWaveform)
+      // Start recording in smaller intervals for smooth waveform
+      mediaRecorder.start(100);
+      this.setState({ 
+        mediaRecorder, 
+        isRecording: true, 
+        analyser,
+        previewChunks: [],  // Clear preview chunks when starting new recording
+        audioUrl: null,     // Clear previous audio URL
+        audioBlob: null     // Clear previous blob
+      }, this.drawWaveform);
 
     } catch (err) {
       console.error("Error accessing microphone:", err)
@@ -201,16 +254,28 @@ class StreamlitAudioRecorder extends StreamlitComponentBase {
       cancelAnimationFrame(this.state.animationId)
     }
 
+    if (this.state.audioUrl) {
+      URL.revokeObjectURL(this.state.audioUrl);
+    }
+
+    this.recordingId = this.generateRecordingId();
+
     this.setState({
       isRecording: false,
       audioBlob: null,
       chunks: [],
+      previewChunks: [],
       audioUrl: null,
       audioData: null,
       analyser: null,
       animationId: null
     })
-    Streamlit.setComponentValue(null)
+    
+    Streamlit.setComponentValue({
+      type: 'reset',
+      sessionId: this.sessionId,
+      recordingId: this.recordingId
+    })
   }
 
   downloadRecording = (): void => {
@@ -249,68 +314,65 @@ class StreamlitAudioRecorder extends StreamlitComponentBase {
           width="500" 
           height="100" 
           style={{ 
-            border: 'none',
-            borderRadius: '8px',
-            background: '#f0f0f0',
-            marginBottom: '20px'
+            width: '100%', 
+            marginBottom: '20px', 
+            borderRadius: '5px',
+            backgroundColor: this.state.isRecording ? '#fff4f4' : '#f0f0f0'
           }}
         />
-        <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-          <button 
-            id="record" 
-            onClick={this.state.isRecording ? this.stopRecording : this.startRecording}
-            style={{
-              ...style,
-              padding: '8px 16px',
-              borderRadius: '6px',
-              background: this.state.isRecording ? '#ff4b4b' : 'white',
-              color: this.state.isRecording ? 'white' : '#333',
-              cursor: 'pointer',
-              transition: 'all 0.2s ease'
-            }}
-          >
-            {this.state.isRecording ? 'Stop Recording' : 'Start Recording'}
-          </button>
-          <button 
-            id="reset" 
-            onClick={this.resetRecording} 
-            style={{
-              ...style,
-              padding: '8px 16px',
-              borderRadius: '6px',
-              background: 'white',
-              cursor: 'pointer',
-              transition: 'all 0.2s ease'
-            }}
-          >
-            Reset
-          </button>
-          <button 
-            id="download" 
-            onClick={this.downloadRecording} 
-            style={{
-              ...style,
-              padding: '8px 16px',
-              borderRadius: '6px',
-              background: 'white',
-              cursor: 'pointer',
-              transition: 'all 0.2s ease'
-            }}
-          >
-            Download
-          </button>
-          {this.state.audioUrl && (
-            <audio
-              id="audio"
-              controls
-              src={this.state.audioUrl}
-              style={{ 
-                marginLeft: 'auto',
-                width: '250px',
-                height: '40px',
-                borderRadius: '20px'
+        
+        <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap' }}>
+          {!this.state.isRecording ? (
+            <button
+              onClick={this.startRecording}
+              style={{
+                padding: '10px 20px',
+                borderRadius: '5px',
+                border: 'none',
+                backgroundColor: '#ff4b4b',
+                color: 'white',
+                cursor: 'pointer'
               }}
-            />
+            >
+              Start Recording
+            </button>
+          ) : (
+            <button
+              onClick={this.stopRecording}
+              style={{
+                padding: '10px 20px',
+                borderRadius: '5px',
+                border: 'none',
+                backgroundColor: '#4b4bff',
+                color: 'white',
+                cursor: 'pointer'
+              }}
+            >
+              Stop Recording
+            </button>
+          )}
+          
+          {this.state.audioUrl && (
+            <>
+              <button
+                onClick={this.resetRecording}
+                style={{
+                  padding: '10px 20px',
+                  borderRadius: '5px',
+                  border: 'none',
+                  backgroundColor: '#ff8c4b',
+                  color: 'white',
+                  cursor: 'pointer'
+                }}
+              >
+                Reset Recording
+              </button>
+              <audio 
+                src={this.state.audioUrl} 
+                controls 
+                style={{ marginTop: '10px', width: '100%' }}
+              />
+            </>
           )}
         </div>
       </div>
